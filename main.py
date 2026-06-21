@@ -24,6 +24,7 @@ SYSTEM_PROMPT = """你是一個專業的《寶可夢 朱/紫》(Pokémon Scarlet
 - 對戰組隊建議、招式搭配、持有道具推薦
 - 特殊捕捉地點（哪裡找、幾率、天氣條件等）
 - 奇異異聞所攻略
+- 識別遊戲截圖內容並給出攻略建議
 
 回答規則：
 1. 優先用繁體中文回答
@@ -31,23 +32,21 @@ SYSTEM_PROMPT = """你是一個專業的《寶可夢 朱/紫》(Pokémon Scarlet
 3. 有多個選項時用條列式整理
 4. 對戰建議要說明原因
 5. 不確定答案時請誠實說明並建議查閱 Bulbapedia 或攻略網站
-6. 回答長度適中，不要過於冗長"""
+6. 回答長度適中，不要過於冗長
+7. 看到遊戲截圖時，主動描述畫面內容並給出相關攻略建議"""
 
-# 每個 chat_id 保存對話歷史，格式符合 Gemini multi-turn chat
-# { chat_id: [{"role": "user", "parts": [...]}, {"role": "model", "parts": [...]}] }
 chat_histories: dict[int, list] = {}
-MAX_HISTORY_TURNS = 20  # 保留最近 20 輪，避免 token 過多
+MAX_HISTORY_TURNS = 20
+
+gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
 
 
-client = genai.Client(api_key=GOOGLE_API_KEY)
-
-
-def get_gemini_reply(chat_id: int, user_text: str) -> str:
+def get_gemini_reply(chat_id: int, parts: list) -> str:
     history = chat_histories.get(chat_id, [])
-    history.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
+    history.append(types.Content(role="user", parts=parts))
 
     try:
-        response = client.models.generate_content(
+        response = gemini_client.models.generate_content(
             model="gemini-2.0-flash",
             contents=history,
             config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
@@ -59,40 +58,47 @@ def get_gemini_reply(chat_id: int, user_text: str) -> str:
         chat_histories[chat_id] = history
         return reply
     except Exception as e:
-        history.pop()  # 移除剛才加入的 user message
+        history.pop()
         logger.error(f"Gemini error: {e}")
         return f"⚠️ 發生錯誤，請稍後再試。\n錯誤訊息：{str(e)}"
 
 
-async def send_message(client: httpx.AsyncClient, chat_id: int, text: str) -> None:
+async def download_photo(http: httpx.AsyncClient, file_id: str) -> bytes:
+    r = await http.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id})
+    file_path = r.json()["result"]["file_path"]
+    r = await http.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}")
+    return r.content
+
+
+async def send_message(http: httpx.AsyncClient, chat_id: int, text: str) -> None:
     if len(text) > 4000:
         text = text[:4000] + "\n\n...（回答過長，請換個方式詢問）"
-    await client.post(
+    await http.post(
         f"{TELEGRAM_API}/sendMessage",
         json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
     )
 
 
-async def send_typing(client: httpx.AsyncClient, chat_id: int) -> None:
-    await client.post(
+async def send_typing(http: httpx.AsyncClient, chat_id: int) -> None:
+    await http.post(
         f"{TELEGRAM_API}/sendChatAction",
         json={"chat_id": chat_id, "action": "typing"},
     )
 
 
-async def set_webhook(client: httpx.AsyncClient) -> None:
+async def set_webhook(http: httpx.AsyncClient) -> None:
     if not WEBHOOK_URL:
         logger.warning("WEBHOOK_URL not set, skipping webhook registration")
         return
     url = f"{WEBHOOK_URL}/webhook"
-    r = await client.post(f"{TELEGRAM_API}/setWebhook", json={"url": url})
+    r = await http.post(f"{TELEGRAM_API}/setWebhook", json={"url": url})
     logger.info(f"Webhook set to {url}: {r.json()}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with httpx.AsyncClient(timeout=10) as client:
-        await set_webhook(client)
+    async with httpx.AsyncClient(timeout=10) as http:
+        await set_webhook(http)
     yield
 
 
@@ -109,35 +115,34 @@ async def webhook(request: Request):
 
     chat_id: int = message["chat"]["id"]
     text: str = message.get("text", "").strip()
+    caption: str = message.get("caption", "").strip()
+    photos = message.get("photo")
 
-    if not text:
-        return Response("ok")
-
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=20) as http:
+        # 指令處理
         if text == "/start":
             chat_histories.pop(chat_id, None)
             await send_message(
-                client,
-                chat_id,
+                http, chat_id,
                 "👋 你好！我是**紫羅蘭**，你的《寶可夢 朱/紫》專屬攻略助理！\n\n"
                 "你可以問我：\n"
                 "• 招式怎麼取得（例：「水砲怎麼學？」）\n"
                 "• 道館攻略（例：「第一個道館用哪隻？」）\n"
                 "• 組隊建議（例：「水系隊伍推薦」）\n"
-                "• 捕捉地點（例：「哪裡找長毛狗？」）\n\n"
+                "• 捕捉地點（例：「哪裡找長毛狗？」）\n"
+                "• 📸 **直接傳遊戲截圖**，我會幫你分析！\n\n"
                 "直接傳訊息給我就好！對話記憶功能已啟用 🧠",
             )
             return Response("ok")
 
         if text == "/clear":
             chat_histories.pop(chat_id, None)
-            await send_message(client, chat_id, "🗑️ 對話記憶已清除！")
+            await send_message(http, chat_id, "🗑️ 對話記憶已清除！")
             return Response("ok")
 
         if text == "/help":
             await send_message(
-                client,
-                chat_id,
+                http, chat_id,
                 "📖 **使用說明**\n\n"
                 "直接用中文問我任何寶可夢朱/紫的問題！\n\n"
                 "**範例問題：**\n"
@@ -146,15 +151,40 @@ async def webhook(request: Request):
                 "• 主線建議道館順序\n"
                 "• 怎麼捕捉傳說寶可夢\n"
                 "• 推薦一隊平衡的隊伍配置\n\n"
+                "**截圖功能：**\n"
+                "直接傳遊戲截圖，可加說明文字（例：「這個怎麼打？」）\n\n"
                 "**指令：**\n"
                 "/clear — 清除對話記憶\n"
                 "/help — 顯示此說明",
             )
             return Response("ok")
 
-        await send_typing(client, chat_id)
-        reply = get_gemini_reply(chat_id, text)
-        await send_message(client, chat_id, reply)
+        await send_typing(http, chat_id)
+
+        # 圖片訊息
+        if photos:
+            # 取最高解析度的圖片
+            best_photo = max(photos, key=lambda p: p["file_size"])
+            image_bytes = await download_photo(http, best_photo["file_id"])
+
+            parts = [
+                types.Part(
+                    inline_data=types.Blob(mime_type="image/jpeg", data=image_bytes)
+                )
+            ]
+            if caption:
+                parts.append(types.Part(text=caption))
+            else:
+                parts.append(types.Part(text="請分析這張寶可夢朱/紫的遊戲截圖，描述畫面內容並給出攻略建議。"))
+
+            reply = get_gemini_reply(chat_id, parts)
+            await send_message(http, chat_id, reply)
+            return Response("ok")
+
+        # 純文字訊息
+        if text:
+            reply = get_gemini_reply(chat_id, [types.Part(text=text)])
+            await send_message(http, chat_id, reply)
 
     return Response("ok")
 
