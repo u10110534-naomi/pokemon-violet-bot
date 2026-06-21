@@ -73,10 +73,18 @@ async def download_photo(http: httpx.AsyncClient, file_id: str) -> bytes:
 async def send_message(http: httpx.AsyncClient, chat_id: int, text: str) -> None:
     if len(text) > 4000:
         text = text[:4000] + "\n\n...（回答過長，請換個方式詢問）"
-    await http.post(
+
+    # 先試 Markdown，若 Telegram 因符號不平衡拒收（400），改用純文字重送
+    r = await http.post(
         f"{TELEGRAM_API}/sendMessage",
         json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
     )
+    if r.status_code != 200:
+        logger.warning(f"Markdown send failed ({r.status_code}): {r.text[:200]}; retrying as plain text")
+        await http.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+        )
 
 
 async def send_typing(http: httpx.AsyncClient, chat_id: int) -> None:
