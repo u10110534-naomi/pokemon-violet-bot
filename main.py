@@ -70,10 +70,25 @@ async def download_photo(http: httpx.AsyncClient, file_id: str) -> bytes:
     return r.content
 
 
-async def send_message(http: httpx.AsyncClient, chat_id: int, text: str) -> None:
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n...（回答過長，請換個方式詢問）"
+CHUNK_SIZE = 3900  # 低於 Telegram 4096 上限，預留 Markdown 餘裕
 
+
+def split_text(text: str, limit: int = CHUNK_SIZE) -> list[str]:
+    """把長訊息切成多段，盡量在換行（段落）處斷開，避免切斷句子。"""
+    chunks: list[str] = []
+    while len(text) > limit:
+        # 在 limit 範圍內找最後一個換行當作切點
+        split_at = text.rfind("\n", 0, limit)
+        if split_at <= 0:
+            split_at = limit  # 找不到換行就硬切
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+async def _send_one(http: httpx.AsyncClient, chat_id: int, text: str) -> None:
     # 先試 Markdown，若 Telegram 因符號不平衡拒收（400），改用純文字重送
     r = await http.post(
         f"{TELEGRAM_API}/sendMessage",
@@ -85,6 +100,15 @@ async def send_message(http: httpx.AsyncClient, chat_id: int, text: str) -> None
             f"{TELEGRAM_API}/sendMessage",
             json={"chat_id": chat_id, "text": text},
         )
+
+
+async def send_message(http: httpx.AsyncClient, chat_id: int, text: str) -> None:
+    parts = split_text(text)
+    total = len(parts)
+    for i, part in enumerate(parts, 1):
+        # 多段時在開頭標註頁碼，方便閱讀
+        prefix = f"（{i}/{total}）\n" if total > 1 else ""
+        await _send_one(http, chat_id, prefix + part)
 
 
 async def send_typing(http: httpx.AsyncClient, chat_id: int) -> None:
