@@ -159,31 +159,31 @@ async def webhook(request: Request):
             )
             return Response("ok")
 
-        await send_typing(http, chat_id)
+        TRIGGER = "@@"
 
-        # 圖片訊息
+        # 圖片訊息：caption 必須以 @@ 開頭
         if photos:
-            # 取最高解析度的圖片
+            if not caption.startswith(TRIGGER):
+                return Response("ok")
+            question = caption[len(TRIGGER):].strip() or "請分析這張寶可夢朱/紫的遊戲截圖，描述畫面內容並給出攻略建議。"
+            await send_typing(http, chat_id)
             best_photo = max(photos, key=lambda p: p["file_size"])
             image_bytes = await download_photo(http, best_photo["file_id"])
-
             parts = [
-                types.Part(
-                    inline_data=types.Blob(mime_type="image/jpeg", data=image_bytes)
-                )
+                types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=image_bytes)),
+                types.Part(text=question),
             ]
-            if caption:
-                parts.append(types.Part(text=caption))
-            else:
-                parts.append(types.Part(text="請分析這張寶可夢朱/紫的遊戲截圖，描述畫面內容並給出攻略建議。"))
-
             reply = get_gemini_reply(chat_id, parts)
             await send_message(http, chat_id, reply)
             return Response("ok")
 
-        # 純文字訊息
-        if text:
-            reply = get_gemini_reply(chat_id, [types.Part(text=text)])
+        # 純文字訊息：必須以 @@ 開頭
+        if text and text.startswith(TRIGGER):
+            question = text[len(TRIGGER):].strip()
+            if not question:
+                return Response("ok")
+            await send_typing(http, chat_id)
+            reply = get_gemini_reply(chat_id, [types.Part(text=question)])
             await send_message(http, chat_id, reply)
 
     return Response("ok")
