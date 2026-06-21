@@ -47,7 +47,7 @@ def get_gemini_reply(chat_id: int, parts: list) -> str:
 
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash-preview-05-20",
+            model="gemini-1.5-flash",
             contents=history,
             config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
         )
