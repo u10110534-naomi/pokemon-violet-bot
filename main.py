@@ -3,14 +3,15 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 import httpx
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # e.g. https://xxx.railway.app
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"].strip()
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 SYSTEM_PROMPT = """你是一個專業的《寶可夢 朱/紫》(Pokémon Scarlet/Violet) 遊戲攻略助理，名字叫「紫羅蘭」。
@@ -38,28 +39,27 @@ chat_histories: dict[int, list] = {}
 MAX_HISTORY_TURNS = 20  # 保留最近 20 輪，避免 token 過多
 
 
-def get_gemini_reply(chat_id: int, user_text: str) -> str:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
-        system_instruction=SYSTEM_PROMPT,
-    )
+client = genai.Client(api_key=GOOGLE_API_KEY)
 
+
+def get_gemini_reply(chat_id: int, user_text: str) -> str:
     history = chat_histories.get(chat_id, [])
-    chat = model.start_chat(history=history)
+    history.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
 
     try:
-        response = chat.send_message(user_text)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=history,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        )
         reply = response.text
-
-        # 更新對話歷史
-        updated = list(chat.history)
-        if len(updated) > MAX_HISTORY_TURNS * 2:
-            updated = updated[-(MAX_HISTORY_TURNS * 2):]
-        chat_histories[chat_id] = updated
-
+        history.append(types.Content(role="model", parts=[types.Part(text=reply)]))
+        if len(history) > MAX_HISTORY_TURNS * 2:
+            history = history[-(MAX_HISTORY_TURNS * 2):]
+        chat_histories[chat_id] = history
         return reply
     except Exception as e:
+        history.pop()  # 移除剛才加入的 user message
         logger.error(f"Gemini error: {e}")
         return f"⚠️ 發生錯誤，請稍後再試。\n錯誤訊息：{str(e)}"
 
